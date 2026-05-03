@@ -51,10 +51,62 @@ _did_run_init = False
 
 
 def run_init():
+    """Initialize JAX distributed runtime when launcher metadata is available.
+
+    For single-process utility scripts (for example dataset preprocessing), we
+    skip distributed init unless explicit coordinator/process metadata exists.
+    """
     global _did_run_init
     if _did_run_init:
         return
-    jax.distributed.initialize()
+
+    coordinator = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    num_processes = os.environ.get("JAX_NUM_PROCESSES")
+    process_id = os.environ.get("JAX_PROCESS_ID")
+
+    # Map common torchrun env vars onto JAX distributed init args.
+    if coordinator is None:
+        master_addr = os.environ.get("MASTER_ADDR")
+        master_port = os.environ.get("MASTER_PORT")
+        if master_addr and master_port:
+            coordinator = f"{master_addr}:{master_port}"
+    if num_processes is None and os.environ.get("WORLD_SIZE"):
+        num_processes = os.environ["WORLD_SIZE"]
+    if process_id is None and os.environ.get("RANK"):
+        process_id = os.environ["RANK"]
+
+    init_kwargs = None
+    if coordinator and num_processes and process_id:
+        init_kwargs = {
+            "coordinator_address": coordinator,
+            "num_processes": int(num_processes),
+            "process_id": int(process_id),
+        }
+
+    declared_multi_proc = False
+    if num_processes is not None:
+        declared_multi_proc = int(num_processes) > 1
+    elif os.environ.get("WORLD_SIZE"):
+        declared_multi_proc = int(os.environ["WORLD_SIZE"]) > 1
+
+    # For single-process utility runs, avoid distributed auto-probing (which
+    # can trigger noisy TPU metadata warnings on GPU hosts).
+    if init_kwargs is None and not declared_multi_proc:
+        _did_run_init = True
+        return
+
+    try:
+        if init_kwargs is not None:
+            jax.distributed.initialize(**init_kwargs)
+        else:
+            # Keep existing auto-detection behavior for TPU/managed runtimes.
+            jax.distributed.initialize()
+    except ValueError as err:
+        msg = str(err)
+        missing_coord = "coordinator_address should be defined" in msg
+        if not (missing_coord and not declared_multi_proc):
+            raise
+
     _did_run_init = True
 
 

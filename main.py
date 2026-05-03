@@ -1,4 +1,5 @@
 import argparse
+import os
 
 def main():
     parser = argparse.ArgumentParser()
@@ -7,6 +8,11 @@ def main():
     parser.add_argument("--workdir", type=str, default="runs", help="Local workdir root for checkpoints/logs.")
     args = parser.parse_args()
     args.output_dir = args.workdir
+
+    # Prefer all visible GPUs on this workstation and avoid slow TPU metadata
+    # probes. Users can still override this explicitly in the shell.
+    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     # Delay importing train entrypoints until after CLI selection so distributed
     # init only runs for the active path.

@@ -140,8 +140,7 @@ def create_imagenet_split(
 
     rank = jax.process_index()
     sampler = DistributedSampler(ds, num_replicas=jax.process_count(), rank=rank, shuffle=True)
-    loader = DataLoader(
-        ds,
+    loader_kwargs = dict(
         batch_size=batch_size,
         drop_last=(split == "train"),
         worker_init_fn=partial(worker_init_fn, rank=rank),
@@ -151,6 +150,9 @@ def create_imagenet_split(
         pin_memory=pin_memory,
         persistent_workers=True if num_workers > 0 else False,
     )
+    if num_workers > 0:
+        loader_kwargs["multiprocessing_context"] = "spawn"
+    loader = DataLoader(ds, **loader_kwargs)
 
     if use_latent or use_cache:
         encode_fn, decode_fn = vae_enc_decode()

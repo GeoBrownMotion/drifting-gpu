@@ -6,6 +6,9 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 import jax.experimental.multihost_utils as mu
@@ -44,7 +47,7 @@ def _generator_model_config(model) -> dict:
     }
 
 
-def train_step(state: TrainState, labels, samples, negative_samples, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), max_grad_norm=2.0):
+def train_step(state: TrainState, labels, samples, negative_samples, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), max_grad_norm=2.0, grad_accum_steps=1):
     """Run one generator optimization step.
 
     Args:
@@ -64,6 +67,8 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         activation_kwargs: keyword args forwarded to feature activation extraction.
         loss_kwargs: keyword args forwarded to `drift_loss`.
         max_grad_norm: gradient clipping norm.
+        grad_accum_steps: split the label batch into this many microbatches and
+            average gradients before one optimizer update.
     """
     rng_step = jax.random.fold_in(rng_init, state.step)
 
@@ -149,7 +154,49 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         (loss, metric), grads = grad_fn(state.params)
         return loss, metric, grads
 
-    loss, metric, grads = loss_grad_info(labels, samples, negative_samples, cfg, rng_step)
+    grad_accum_steps = int(grad_accum_steps)
+    if grad_accum_steps <= 1:
+        loss, metric, grads = loss_grad_info(labels, samples, negative_samples, cfg, rng_step)
+    else:
+        batch_size = labels.shape[0]
+        if batch_size % grad_accum_steps != 0:
+            raise ValueError(
+                f"labels batch size {batch_size} must be divisible by grad_accum_steps={grad_accum_steps}"
+            )
+        micro_size = batch_size // grad_accum_steps
+
+        def split_microbatch(x):
+            return x.reshape((grad_accum_steps, micro_size, *x.shape[1:]))
+
+        labels_micro = split_microbatch(labels)
+        samples_micro = split_microbatch(samples)
+        negative_micro = split_microbatch(negative_samples)
+        cfg_micro = split_microbatch(cfg)
+        zero_grads = jax.tree.map(jnp.zeros_like, state.params)
+
+        def accum_body(grads_sum, micro):
+            i, micro_labels, micro_samples, micro_negative, micro_cfg = micro
+            micro_rng = jax.random.fold_in(rng_step, i)
+            micro_loss, micro_metric, micro_grads = loss_grad_info(
+                micro_labels,
+                micro_samples,
+                micro_negative,
+                micro_cfg,
+                micro_rng,
+            )
+            grads_sum = jax.tree.map(lambda a, b: a + b, grads_sum, micro_grads)
+            return grads_sum, (micro_loss, micro_metric)
+
+        micro_indices = jnp.arange(grad_accum_steps)
+        grads_sum, (losses, metrics) = jax.lax.scan(
+            accum_body,
+            zero_grads,
+            (micro_indices, labels_micro, samples_micro, negative_micro, cfg_micro),
+        )
+        inv_accum = 1.0 / grad_accum_steps
+        grads = jax.tree.map(lambda x: x * inv_accum, grads_sum)
+        loss = losses.mean()
+        metric = jax.tree.map(lambda x: x.mean(axis=0), metrics)
 
     g_norm = optax.global_norm(grads)
     clipper = optax.clip_by_global_norm(max_grad_norm)
@@ -236,6 +283,7 @@ def train_gen(
         use_mean=True,
         every_k_block=2,
     ),
+    grad_accum_steps=1,
     max_grad_norm=2.0,
     loss_kwargs=dict(R_list=(0.02, 0.05, 0.2)),
     keep_every=500000,  # long-term checkpoint retention interval
@@ -243,6 +291,8 @@ def train_gen(
     init_from="",  # `hf://<name>` or local dir of model
     push_per_step=0,  # memory-bank fill factor per train step
     push_at_resume=3000,  # extra fill multiplier when resuming
+    eval_at_step1=True,  # run an initial sanity FID pass
+    eval_at_end=True,  # run evaluation at the final training step
     workdir="runs",  # run root containing checkpoints/logs
 ):
     """
@@ -278,7 +328,7 @@ def train_gen(
     assert feature_params is not None, "feature_params must be provided for multi-host safe feature extraction"
     loss_kwargs['R_list'] = tuple(loss_kwargs['R_list'])
     state_sharding = jax.tree.map(lambda x: x.sharding, state)
-    train_step_jit = jax.jit(partial(train_step, rng_init=rng_train, learning_rate_fn=learning_rate_fn, feature_apply=activation_fn, activation_kwargs=activation_kwargs, loss_kwargs=loss_kwargs, **forward_dict, max_grad_norm=max_grad_norm), out_shardings=(state_sharding, None))
+    train_step_jit = jax.jit(partial(train_step, rng_init=rng_train, learning_rate_fn=learning_rate_fn, feature_apply=activation_fn, activation_kwargs=activation_kwargs, loss_kwargs=loss_kwargs, **forward_dict, max_grad_norm=max_grad_norm, grad_accum_steps=grad_accum_steps), out_shardings=(state_sharding, None))
 
     ema_to_params_func = map_to_sharding(state.params)
     
@@ -358,7 +408,12 @@ def train_gen(
             )
             mu.sync_global_devices("save checkpoint finished")
 
-        if (step % eval_per_step == 0) or (step == 1) or (step == total_steps):
+        should_eval = (
+            (eval_per_step and step % eval_per_step == 0)
+            or (eval_at_step1 and step == 1)
+            or (eval_at_end and step == total_steps)
+        )
+        if should_eval:
             is_sanity = (step == 1)  # do a sanity check, to make sure FID env is working
 
             n_samples = 500 if is_sanity else eval_samples

@@ -8,6 +8,9 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 import optax

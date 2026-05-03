@@ -10,8 +10,6 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-os.environ.setdefault("JAX_PLATFORMS", "tpu,cpu")
-
 import jax
 import jax.numpy as jnp
 import jax.experimental.multihost_utils as mu
@@ -99,6 +97,7 @@ def create_cached_dataset(
     target_path: str,
     data_path: str,
     *,
+    backend: str = "auto",
     num_workers: int = 8,
     prefetch_factor: int = 2,
     pin_memory: bool = False,
@@ -108,12 +107,35 @@ def create_cached_dataset(
     from dataset.vae import vae_enc_decode
     from utils.hsdp_util import set_global_mesh
 
-    local_tpu_devices = jax.local_devices(backend="tpu")
-    n_local_devices = max(1, len(local_tpu_devices))
+    def _pick_devices() -> tuple[str, list[jax.Device]]:
+        backend_order = {
+            "gpu": ("gpu",),
+            "cpu": ("cpu",),
+            "tpu": ("tpu",),
+            "auto": ("gpu", "cpu", "tpu"),
+        }[backend]
+        for backend_name in backend_order:
+            try:
+                devices = list(jax.local_devices(backend=backend_name))
+                if devices:
+                    return backend_name, devices
+            except Exception:
+                continue
+        raise RuntimeError(
+            f"No local JAX devices found for backend='{backend}'. "
+            "If GPUs are installed, try launching with JAX_PLATFORMS=cuda,cpu."
+        )
+
+    active_backend, local_devices = _pick_devices()
+    print(
+        f"[latent-cache] backend={active_backend} local_devices={len(local_devices)} processes={jax.process_count()}",
+        flush=True,
+    )
+    n_local_devices = max(1, len(local_devices))
 
     if local_batch_size % n_local_devices != 0:
         raise ValueError(
-            f"`local_batch_size` must be divisible by local TPU device count={n_local_devices}, got {local_batch_size}."
+            f"`local_batch_size` must be divisible by local device count={n_local_devices}, got {local_batch_size}."
         )
 
     set_global_mesh(min(8, n_local_devices * jax.process_count()))
@@ -126,7 +148,7 @@ def create_cached_dataset(
     # can participate in the cache build.
     encode_fn, _ = vae_enc_decode(replicate_params=True)
 
-    local_mesh = Mesh(np.array(local_tpu_devices), axis_names=("data",))
+    local_mesh = Mesh(np.array(local_devices), axis_names=("data",))
     sample_sharding = NamedSharding(local_mesh, P("data", None, None, None))
     rng_sharding = NamedSharding(local_mesh, P("data", None))
     output_sharding = NamedSharding(local_mesh, P("data", None, None, None))
@@ -191,49 +213,56 @@ def create_cached_dataset(
         loader = torch.utils.data.DataLoader(**loader_kwargs)
 
         base_rng = jax.random.PRNGKey(0)
-        for step, (samples, _, rel_paths) in tqdm(
-            enumerate(loader),
-            total=len(loader),
+        with tqdm(
+            total=len(dataset),
             desc=f"cache:{split}:host{jax.process_index()}",
-        ):
-            step_rng = jax.random.fold_in(base_rng, step)
-            step_rng = jax.random.split(step_rng, n_local_devices)
+            unit="img",
+            dynamic_ncols=True,
+            smoothing=0.05,
+        ) as progress:
+            for step, (samples, _, rel_paths) in enumerate(loader):
+                step_rng = jax.random.fold_in(base_rng, step)
+                step_rng = jax.random.split(step_rng, n_local_devices)
 
-            n_valid_global = samples.shape[0]
-            rel_paths = list(rel_paths)
-            if n_valid_global != global_batch_size:
-                pad = global_batch_size - n_valid_global
-                samples = torch.cat([samples, torch.zeros((pad,) + samples.shape[1:], dtype=samples.dtype)], dim=0)
-                rel_paths.extend([""] * pad)
+                n_valid_global = samples.shape[0]
+                rel_paths = list(rel_paths)
+                if n_valid_global != global_batch_size:
+                    pad = global_batch_size - n_valid_global
+                    samples = torch.cat([samples, torch.zeros((pad,) + samples.shape[1:], dtype=samples.dtype)], dim=0)
+                    rel_paths.extend([""] * pad)
 
-            local_samples = samples[process_slice_start:process_slice_end]
-            encoded_local = encode(
-                jax.device_put(_prepare_batch_data(local_samples), sample_sharding),
-                jax.device_put(step_rng, rng_sharding),
-            )
-            encoded_local = jax.tree_util.tree_map(np.asarray, encoded_local)
-            encoded = {
-                "moments": mu.process_allgather(encoded_local["moments"], tiled=True),
-                "moments_flip": mu.process_allgather(encoded_local["moments_flip"], tiled=True),
-            }
-
-            write_items = []
-            for i, rel_path in enumerate(rel_paths[:n_valid_global]):
-                if not rel_path:
-                    continue
-                output_path = str(Path(target_path, split, rel_path).with_suffix(".pt"))
-                write_items.append(
-                    _CacheWriteItem(
-                        output_path=output_path,
-                        moments=np.asarray(encoded["moments"][i]),
-                        moments_flip=np.asarray(encoded["moments_flip"][i]),
-                    )
+                local_samples = samples[process_slice_start:process_slice_end]
+                encoded_local = encode(
+                    jax.device_put(_prepare_batch_data(local_samples), sample_sharding),
+                    jax.device_put(step_rng, rng_sharding),
                 )
-            if save_pool is None:
-                for item in write_items:
-                    _write_cache_file(item)
-            else:
-                save_futures.extend(save_pool.submit(_write_cache_file, item) for item in write_items)
+                encoded_local = jax.tree_util.tree_map(np.asarray, encoded_local)
+                encoded = {
+                    "moments": mu.process_allgather(encoded_local["moments"], tiled=True),
+                    "moments_flip": mu.process_allgather(encoded_local["moments_flip"], tiled=True),
+                }
+
+                write_items = []
+                for i, rel_path in enumerate(rel_paths[:n_valid_global]):
+                    if not rel_path:
+                        continue
+                    output_path = str(Path(target_path, split, rel_path).with_suffix(".pt"))
+                    write_items.append(
+                        _CacheWriteItem(
+                            output_path=output_path,
+                            moments=np.asarray(encoded["moments"][i]),
+                            moments_flip=np.asarray(encoded["moments_flip"][i]),
+                        )
+                    )
+                if save_pool is None:
+                    for item in write_items:
+                        _write_cache_file(item)
+                else:
+                    save_futures.extend(save_pool.submit(_write_cache_file, item) for item in write_items)
+
+                progress.update(n_valid_global)
+                if save_pool is not None:
+                    progress.set_postfix(queued_writes=len(save_futures), refresh=False)
 
         if jax.process_count() > 1:
             mu.sync_global_devices(f"latent cache split {split} encoded")
@@ -255,6 +284,7 @@ def build_cache_from_args(args: argparse.Namespace) -> None:
         local_batch_size=int(args.local_batch_size),
         target_path=args.target_path,
         data_path=args.data_path,
+        backend=str(args.backend),
         num_workers=int(args.num_workers),
         prefetch_factor=int(args.prefetch_factor),
         pin_memory=bool(args.pin_memory),
@@ -273,6 +303,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Per-process cache batch size. Must divide jax.local_device_count().",
     )
     parser.add_argument("--num-workers", type=int, default=8, help="DataLoader worker count.")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=("gpu", "cpu", "tpu", "auto"),
+        default="auto",
+        help="JAX backend for latent encoding. `auto` prefers GPU then CPU.",
+    )
     parser.add_argument(
         "--prefetch-factor",
         type=int,

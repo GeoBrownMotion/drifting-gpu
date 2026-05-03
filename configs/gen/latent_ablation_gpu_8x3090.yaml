@@ -13,7 +13,7 @@ dataset:
   use_cache: true
   num_classes: 1000
   batch_size: 1024
-  eval_batch_size: 64
+  eval_batch_size: 2048
   kwargs:
     num_workers: 8
     pin_memory: true
@@ -53,15 +53,15 @@ optimizer:
   adam_b2: 0.95
 
 train:
-  train_batch_size: 32
-  grad_accum_steps: 16
+  train_batch_size: 64
+  grad_accum_steps: 8
   seed: 42
   total_steps: 30000
   save_per_step: 2000
   keep_every: 10000
   eval_per_step: 5000
-  pos_per_sample: 32
-  neg_per_sample: 32
+  pos_per_sample: 64
+  neg_per_sample: 16
   positive_bank_size: 128
   negative_bank_size: 1000
   forward_dict:

@@ -174,6 +174,19 @@ def _load_ref_stats(dataset_name: str):
     return {"mu": data["mu"], "sigma": data["sigma"]}
 
 
+def _is_finite_tree(tree) -> bool:
+    return all(np.all(np.isfinite(np.asarray(x))) for x in jax.tree.leaves(tree))
+
+
+def _log_eval_metric_failure(metric_name: str, err: Exception) -> None:
+    log_for_0(
+        "Skipping %s metric because evaluation statistics were invalid: %s: %s",
+        metric_name,
+        type(err).__name__,
+        err,
+    )
+
+
 def evaluate_fid(
     dataset_name,
     gen_func,
@@ -252,17 +265,39 @@ def evaluate_fid(
 
     metrics: Dict[str, float] = {}
     if eval_fid:
-        metrics["fid"] = float(compute_frechet_distance(ref["mu"], stats["mu"], ref["sigma"], stats["sigma"]))
+        try:
+            if not _is_finite_tree((ref["mu"], ref["sigma"], stats["mu"], stats["sigma"])):
+                raise FloatingPointError("FID mean/covariance contains NaN or inf")
+            metrics["fid"] = float(compute_frechet_distance(ref["mu"], stats["mu"], ref["sigma"], stats["sigma"]))
+        except (FloatingPointError, np.linalg.LinAlgError, ValueError) as err:
+            _log_eval_metric_failure("FID", err)
+            metrics["fid"] = float("nan")
     if eval_isc and "logits" in stats:
-        mean, std = _compute_inception_score(stats["logits"])
-        metrics["isc_mean"] = mean
-        metrics["isc_std"] = std
+        try:
+            if not _is_finite_tree(stats["logits"]):
+                raise FloatingPointError("Inception logits contain NaN or inf")
+            mean, std = _compute_inception_score(stats["logits"])
+            metrics["isc_mean"] = mean
+            metrics["isc_std"] = std
+        except (FloatingPointError, ValueError) as err:
+            _log_eval_metric_failure("Inception Score", err)
+            metrics["isc_mean"] = float("nan")
+            metrics["isc_std"] = float("nan")
     if eval_prc_recall and "features" in stats:
-        ref_images = np.load(_PR_REF_PATH)["arr_0"].astype(np.uint8)
-        ref_stats = _compute_stats(ref_images, 10000, compute_logits=False, compute_features=True)
-        precision, recall = compute_precision_recall(ref_stats["features"], stats["features"], k=3)
-        metrics["precision"] = float(precision)
-        metrics["recall"] = float(recall)
+        try:
+            if not _is_finite_tree(stats["features"]):
+                raise FloatingPointError("Generated Inception features contain NaN or inf")
+            ref_images = np.load(_PR_REF_PATH)["arr_0"].astype(np.uint8)
+            ref_stats = _compute_stats(ref_images, 10000, compute_logits=False, compute_features=True)
+            if not _is_finite_tree(ref_stats["features"]):
+                raise FloatingPointError("Reference Inception features contain NaN or inf")
+            precision, recall = compute_precision_recall(ref_stats["features"], stats["features"], k=3)
+            metrics["precision"] = float(precision)
+            metrics["recall"] = float(recall)
+        except (FloatingPointError, ValueError) as err:
+            _log_eval_metric_failure("precision/recall", err)
+            metrics["precision"] = float("nan")
+            metrics["recall"] = float("nan")
 
     metrics["fid_time"] = float(time.time() - start)
     logger.log_dict({f"{log_folder}/{log_prefix}_{k}": v for k, v in metrics.items()})
