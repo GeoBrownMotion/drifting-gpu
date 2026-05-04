@@ -13,6 +13,11 @@ def main():
     # probes. Users can still override this explicitly in the shell.
     os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    # On Ampere/Ada/Hopper GPUs, JAX's default fp32 matmul lowers to TF32
+    # (~bf16 mantissa). The model config sets `attn_fp32: true`, but on GPU
+    # that flag alone does not buy real fp32 attention without this. Override
+    # in the shell if you want the TF32 speedup back.
+    os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
 
     # Delay importing train entrypoints until after CLI selection so distributed
     # init only runs for the active path.

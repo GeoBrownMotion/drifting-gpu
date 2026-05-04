@@ -12,6 +12,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import jax
 import jax.numpy as jnp
 import jax.experimental.multihost_utils as mu
+import numpy as np
 import optax
 from flax.training import train_state
 from tqdm import tqdm
@@ -39,6 +40,34 @@ class TrainState(train_state.TrainState):
     ema_decay: float = 0.999
 
 
+def _tree_all_finite_jax(tree) -> jax.Array:
+    out = jnp.array(True)
+    for leaf in jax.tree.leaves(tree):
+        out = jnp.logical_and(out, jnp.all(jnp.isfinite(leaf)))
+    return out.astype(jnp.float32)
+
+
+def _path_to_str(path) -> str:
+    parts = []
+    for entry in path:
+        parts.append(str(getattr(entry, "key", getattr(entry, "idx", entry))))
+    return "/".join(parts) or "<root>"
+
+
+def _assert_host_tree_finite(name: str, tree, step: int) -> None:
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        arr = np.asarray(leaf)
+        if np.all(np.isfinite(arr)):
+            continue
+        bad = np.argwhere(~np.isfinite(arr))
+        first = tuple(int(i) for i in bad[0]) if bad.size else ()
+        value = arr[first] if first else arr
+        raise FloatingPointError(
+            f"Non-finite {name} at step={step}, path={_path_to_str(path)}, "
+            f"index={first}, value={value}"
+        )
+
+
 def _generator_model_config(model) -> dict:
     return {
         name: value
@@ -47,7 +76,7 @@ def _generator_model_config(model) -> dict:
     }
 
 
-def train_step(state: TrainState, labels, samples, negative_samples, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), max_grad_norm=2.0, grad_accum_steps=1):
+def train_step(state: TrainState, labels, samples, negative_samples, feature_params, feature_apply, rng_init: jax.random.PRNGKey, learning_rate_fn: Any = None, cfg_min=1.0, cfg_max=4.0, neg_cfg_pw=1.0, no_cfg_frac=0.0, gen_per_label=8, activation_kwargs=dict(), loss_kwargs=dict(R_list=[0.02, 0.05, 0.2]), max_grad_norm=2.0, grad_accum_steps=1, debug_finite=False):
     """Run one generator optimization step.
 
     Args:
@@ -69,6 +98,7 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         max_grad_norm: gradient clipping norm.
         grad_accum_steps: split the label batch into this many microbatches and
             average gradients before one optimizer update.
+        debug_finite: return finite-status metrics for NaN/inf localization.
     """
     rng_step = jax.random.fold_in(rng_init, state.step)
 
@@ -103,6 +133,7 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         else:
             sg_features = jax.tree.map(lambda u: rearrange(enforce_ddp(u), '(b x) ... -> b x ...', x=n_pos + n_uncond), sg_features) 
         sg_features = enforce_ddp(sg_features)
+        sg_features_finite = _tree_all_finite_jax(sg_features) if debug_finite else jnp.array(1.0)
 
         def loss_fn(params):
             input_labels = enforce_ddp(repeat(labels, 'b -> (b g)', g=gen_per_label))
@@ -114,12 +145,14 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
                 c=input_labels,
                 cfg_scale=input_cfg,
             )['samples'] 
+            gen_samples_finite = _tree_all_finite_jax(gen_samples) if debug_finite else jnp.array(1.0)
             gen_features = feature_apply(feature_params, gen_samples, **activation_kwargs)
             if bsz % jax.device_count() == 0:
                 gen_features = jax.tree.map(lambda u: rearrange(u, '(b g) ... -> b g ...', g=n_gen), gen_features) # [B, G, F, D]
             else:
                 gen_features = jax.tree.map(lambda u: rearrange(enforce_ddp(u), '(b g) ... -> b g ...', g=n_gen), gen_features) # [B, G, F, D]
             gen_features = enforce_ddp(gen_features)
+            gen_features_finite = _tree_all_finite_jax(gen_features) if debug_finite else jnp.array(1.0)
 
             def feature_loss(sg_features, gen_features):
                 feature_pos, feature_gen, feature_uncond = sg_features[:, :n_pos], gen_features, sg_features[:, n_pos:]
@@ -145,6 +178,10 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
                 total_loss = total_loss + v[0].mean()
                 for k2, v2 in v[1].items():
                     total_info[f'{k2}/{k}'] = v2
+            if debug_finite:
+                total_info['finite/sg_features'] = sg_features_finite
+                total_info['finite/gen_samples'] = gen_samples_finite
+                total_info['finite/gen_features'] = gen_features_finite
             total_loss = total_loss.mean()
             total_info = jax.tree.map(lambda x: x.mean(), total_info)
 
@@ -197,6 +234,17 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         grads = jax.tree.map(lambda x: x * inv_accum, grads_sum)
         loss = losses.mean()
         metric = jax.tree.map(lambda x: x.mean(axis=0), metrics)
+        if debug_finite:
+            for name, value in metrics.items():
+                if name.startswith('finite/'):
+                    metric[name] = value.min(axis=0)
+
+    if debug_finite:
+        metric['finite/loss'] = jnp.isfinite(loss).astype(jnp.float32)
+        metric['finite/grads'] = _tree_all_finite_jax(grads)
+        metric['finite/params'] = _tree_all_finite_jax(state.params)
+        metric['finite/positive_samples'] = _tree_all_finite_jax(samples)
+        metric['finite/negative_samples'] = _tree_all_finite_jax(negative_samples)
 
     g_norm = optax.global_norm(grads)
     clipper = optax.clip_by_global_norm(max_grad_norm)
@@ -210,6 +258,9 @@ def train_step(state: TrainState, labels, samples, negative_samples, feature_par
         new_state.params,
     )
     new_state = new_state.replace(ema_params=new_ema_params)
+
+    if debug_finite:
+        metric['finite/new_params'] = _tree_all_finite_jax(new_state.params)
     
     metric['loss'] = loss
     metric['g_norm'] = g_norm
@@ -293,6 +344,7 @@ def train_gen(
     push_at_resume=3000,  # extra fill multiplier when resuming
     eval_at_step1=True,  # run an initial sanity FID pass
     eval_at_end=True,  # run evaluation at the final training step
+    debug_finite=False,  # raise/log where non-finite values first appear
     workdir="runs",  # run root containing checkpoints/logs
 ):
     """
@@ -328,7 +380,7 @@ def train_gen(
     assert feature_params is not None, "feature_params must be provided for multi-host safe feature extraction"
     loss_kwargs['R_list'] = tuple(loss_kwargs['R_list'])
     state_sharding = jax.tree.map(lambda x: x.sharding, state)
-    train_step_jit = jax.jit(partial(train_step, rng_init=rng_train, learning_rate_fn=learning_rate_fn, feature_apply=activation_fn, activation_kwargs=activation_kwargs, loss_kwargs=loss_kwargs, **forward_dict, max_grad_norm=max_grad_norm, grad_accum_steps=grad_accum_steps), out_shardings=(state_sharding, None))
+    train_step_jit = jax.jit(partial(train_step, rng_init=rng_train, learning_rate_fn=learning_rate_fn, feature_apply=activation_fn, activation_kwargs=activation_kwargs, loss_kwargs=loss_kwargs, **forward_dict, max_grad_norm=max_grad_norm, grad_accum_steps=grad_accum_steps, debug_finite=debug_finite), out_shardings=(state_sharding, None))
 
     ema_to_params_func = map_to_sharding(state.params)
     
@@ -361,6 +413,8 @@ def train_gen(
             processed_batch = preprocess_fn(batch)
             images = processed_batch['images']  # BHWC format
             labels = processed_batch['labels']
+            if debug_finite:
+                _assert_host_tree_finite("preprocessed images", images, step)
             memory_bank_positive.add(images, labels)
             memory_bank_negative.add(images, labels * 0)
             n_push += images.shape[0]
@@ -375,6 +429,9 @@ def train_gen(
 
         positive_samples = memory_bank_positive.sample(labels, n_samples=pos_per_sample)
         negative_samples = memory_bank_negative.sample(labels * 0, n_samples=neg_per_sample)
+        if debug_finite:
+            _assert_host_tree_finite("positive memory-bank samples", positive_samples, step)
+            _assert_host_tree_finite("negative memory-bank samples", negative_samples, step)
 
         merged_positive, merged_negative, merged_labels = merge_data((positive_samples, negative_samples, labels))
 
@@ -386,6 +443,13 @@ def train_gen(
 
         new_state, metrics = train_step_jit(state, merged_labels, merged_positive, merged_negative, feature_params)
         metrics = jax.tree.map(lambda x: x.mean(), metrics)
+        if debug_finite:
+            bad_flags = []
+            for name, value in metrics.items():
+                if name.startswith("finite/") and float(jax.device_get(value)) < 0.5:
+                    bad_flags.append(name)
+            if bad_flags:
+                raise FloatingPointError(f"Non-finite values detected at step={step}: {', '.join(bad_flags)}")
         total_time = time.time() - start_time
         metrics['total_time'] = total_time
         metrics['process_time'] = process_time
